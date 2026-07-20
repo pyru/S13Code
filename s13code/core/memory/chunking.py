@@ -16,6 +16,7 @@ from typing import Protocol
 from urllib.request import Request, urlopen
 
 from .embeddings import Embedder
+from .extraction import extract_html, looks_like_html
 
 
 @dataclass(frozen=True)
@@ -40,8 +41,16 @@ def prepare_markdown(markdown: str) -> tuple[str, str]:
 
     The Session 7 paper corpus contains saved arXiv abstract *pages*, not full
     papers.  Their useful region begins at the paper-title heading and ends
-    before submission history. Other Markdown passes through unchanged.
+    before submission history. A saved HTML page is handed to the dedicated
+    extractor in ``extraction.py``. Other Markdown passes through unchanged.
     """
+    if looks_like_html(markdown):
+        extracted, stats = extract_html(markdown)
+        # Never let a failed extraction silently empty a document: if nothing
+        # survived, index the original and say so in the manifest.
+        if extracted.strip():
+            return extracted, str(stats["extractor"])
+        return markdown, "html_extraction_empty_kept_source"
     abstract_at = markdown.find("> Abstract:")
     history_at = markdown.find("## Submission history")
     if abstract_at >= 0 and history_at > abstract_at:
@@ -86,7 +95,11 @@ Keep markdown formatting intact. Do not add fences, labels, or explanation.'''
         body = json.dumps({"model": self.model, "messages": [{"role": "user", "content": prompt}],
                            "stream": False, "options": {"temperature": 0, "num_predict": 4096}}).encode()
         request = Request(self.base_url + "/api/chat", data=body, headers={"Content-Type": "application/json"})
-        with urlopen(request, timeout=180) as response:  # nosec B310: local configurable service
+        # A 14B segmenter on CPU needs far longer than a GPU deployment. The
+        # ceiling stays configurable so a slow local box does not silently
+        # degrade every block into `segmenter_failed_fallback_to_block`.
+        timeout = float(os.getenv("S13_CHUNK_TIMEOUT_SECONDS", "180"))
+        with urlopen(request, timeout=timeout) as response:  # nosec B310: local configurable service
             return str(json.load(response).get("message", {}).get("content", "")).strip()
 
     def release(self) -> None:
