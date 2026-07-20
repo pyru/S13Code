@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from s13code.core.a2a_adapter import A2AClient, PushCorrelationLedger
 from s13code.core.live_graph import GraphPatch, GraphStore, LiveGraphExecutor, TaskSpec
 from s13code.core.memory import MemoryKind, MemoryRecord, MemoryScope, MemoryStore, Principal, SourceRef
 from s13code.core.memory.embeddings import OllamaNomicEmbedder
@@ -21,6 +22,7 @@ from s13code.planner import ConstrainedGraphPatchPlanner
 from s13code.tools import fetch_url, sandbox_files, sandbox_path, web_search
 
 TextLLM = Callable[[str, str], Awaitable[dict[str, Any]]]
+_REMOTE_REPORT = re.compile(r"^\s*slow\s+remote\s+report\s*:\s*(.+)$", re.IGNORECASE | re.DOTALL)
 
 
 def _work_intent(prompt: str) -> tuple[str, list[TaskSpec]]:
@@ -31,6 +33,11 @@ def _work_intent(prompt: str) -> tuple[str, list[TaskSpec]]:
     network tools outside this registry.
     """
     lower = prompt.lower()
+    if _REMOTE_REPORT.match(prompt):
+        # Dispatch and the wait/resume patch happen inside the planner itself
+        # (see S13Runtime.run): the node never runs locally before an A2A
+        # artifact exists, matching the waiting-first diagram in section 14.
+        return "remote_report", []
     index_directory = re.search(
         r"\bindex every\s+(\.[a-z0-9]+)\s+file\s+under\s+[`'\"]?([^\s`'\",]+)",
         prompt, re.IGNORECASE,
@@ -91,10 +98,27 @@ class S13Runtime:
         self.root.mkdir(parents=True, exist_ok=True)
         self.memory = MemoryStore(self.root / "memory.sqlite", embedder=OllamaNomicEmbedder())
         self.graph = GraphStore(self.root / "graph.sqlite")
+        self.a2a_push_ledger = PushCorrelationLedger(self.root / "a2a_push_ledger.sqlite")
+        # Unset until configure_a2a is called (production wiring lives in
+        # main.py's lifespan). A "remote report" run raises a clear error
+        # instead of silently no-oping if a caller forgets to wire this.
+        self.a2a_client: A2AClient | None = None
+        self.a2a_remote_url: str | None = None
+        self.a2a_push_receive_url: str | None = None
+        self.a2a_push_receive_token: str | None = None
+
+    def configure_a2a(self, *, client: A2AClient, remote_url: str, push_receive_url: str,
+                      push_receive_token: str | None) -> None:
+        """Wire the outbound A2A boundary. Never grants the remote agent local memory."""
+        self.a2a_client = client
+        self.a2a_remote_url = remote_url
+        self.a2a_push_receive_url = push_receive_url
+        self.a2a_push_receive_token = push_receive_token
 
     def close(self) -> None:
         self.memory.close()
         self.graph.close()
+        self.a2a_push_ledger.close()
 
     async def run(self, *, prompt: str | None, scope: MemoryScope | None, llm: TextLLM,
                   source_uri: str | None, source_author: str | None, run_id: str | None = None,
@@ -126,6 +150,39 @@ class S13Runtime:
             r"\b(remember|save (?:this|that)|keep (?:this|that) in mind|correction:)\b", prompt, re.IGNORECASE
         ))
 
+        async def dispatch_remote_specialist() -> GraphPatch:
+            """Send the task to a remote A2A agent; park pending its durable push.
+
+            This runs inside the planner, not a skill worker, because the
+            node must reach ``waiting`` *before* any local coroutine is
+            running for it: nothing here blocks on the remote outcome. The
+            actual resume happens later, out-of-band, when the receiver in
+            ``core/a2a_adapter/push_receiver.py`` verifies and applies the
+            webhook -- possibly after this process restarted.
+            """
+            if runtime.a2a_client is None:
+                raise RuntimeError("A2A remote dispatch is not configured (S13Runtime.configure_a2a)")
+            question = _REMOTE_REPORT.match(prompt).group(1).strip()
+            # Deliberately avoid the literal "remote report" trigger phrase so
+            # the remote side (S13Code's own inbound A2A handler, running the
+            # same S13Runtime in an isolated a2a/inbound memory scope) cannot
+            # recursively redispatch this same task to itself.
+            remote_text = f"slow async remote specialist task: {question}"
+            agent = await runtime.a2a_client.discover(runtime.a2a_remote_url)
+            started = await runtime.a2a_client.send(agent, remote_text, push_url=runtime.a2a_push_receive_url,
+                                                     push_token=runtime.a2a_push_receive_token)
+            node = TaskSpec("remote_specialist", "remote_specialist",
+                            {"prompt": question, "remote_task_id": started["id"]}, {"agent": "remote_specialist"})
+            runtime.a2a_push_ledger.register(task_id=started["id"], run_id=run_id, node_id=node.id)
+            state = started.get("status", {}).get("state")
+            if state in {"completed", "failed", "canceled"}:
+                text = "".join(part.get("text", "") for artifact in started.get("artifacts", [])
+                               for part in artifact.get("parts", []))
+                runtime.a2a_push_ledger.store_artifact(started["id"], text=text, state=state)
+                return GraphPatch(add=(node,), reason="remote A2A task completed synchronously")
+            return GraphPatch(add=(node,), wait=(node.id,),
+                              reason="dispatched to remote A2A agent; parked pending durable push")
+
         class DeterministicPlanner:
             @staticmethod
             def answer_patch(graph, *, reason: str) -> GraphPatch:
@@ -138,11 +195,16 @@ class S13Runtime:
 
             async def plan(self, graph, event):
                 if event.kind == "run_started":
+                    if mode == "remote_report":
+                        return await dispatch_remote_specialist()
                     first = list(initial_frontier)
                     if explicit_memory:
                         first.append(TaskSpec("remember", "remember_explicit_fact", {"text": prompt}))
                     return GraphPatch(add=tuple(first),
                                       reason=f"first frontier selected for {mode}")
+                if (mode == "remote_report" and event.node_id == "remote_specialist"
+                        and event.kind in ("task_succeeded", "task_failed")):
+                    return self.answer_patch(graph, reason="remote A2A artifact returned; synthesizing final answer")
                 if event.node_id == "index_file" and event.kind == "task_succeeded":
                     return GraphPatch(add=(TaskSpec("recall", "memory_recall", {"query": prompt}),),
                                       connect=(("index_file", "recall"),),
@@ -272,6 +334,9 @@ class S13Runtime:
                 elif node["skill"] == "create_reminder" and result.get("artifacts"):
                     evidence.append({"text": "Calendar reminders created: " + ", ".join(result["artifacts"]),
                                      "sources": result["artifacts"], "kind": "calendar_artifact"})
+                elif node["skill"] == "remote_specialist" and result.get("text"):
+                    evidence.append({"text": result["text"], "sources": [f"a2a://{result.get('remote_task_id', 'remote')}"],
+                                     "kind": "a2a_artifact"})
                 elif node["state"] == "failed":
                     evidence.append({"text": result.get("error", "task failed"),
                                      "sources": [f"graph://{run_id}/{node_id}"], "kind": "failure"})
@@ -330,6 +395,20 @@ class S13Runtime:
             ))
             return {"fact": {"id": record.id, "kind": record.kind.value, "text": record.text,
                               "sources": [source.uri for source in record.sources]}}
+
+        async def run_remote_specialist(task: TaskSpec) -> dict[str, Any]:
+            """Reads the artifact a durable push already delivered; never calls out again.
+
+            By the time this executes the node was WAITING and is now PENDING
+            only because ``DurablePushReceiver`` resumed it after a terminal
+            remote outcome was journalled -- see ``dispatch_remote_specialist``
+            above and ``core/a2a_adapter/push_receiver.py``.
+            """
+            artifact = runtime.a2a_push_ledger.artifact(run_id, task.id)
+            if artifact is None:
+                raise RuntimeError("remote A2A artifact was not delivered before resume")
+            return {"text": artifact.text, "remote_task_id": artifact.task_id, "state": artifact.state,
+                    "agent": "remote_specialist", "provider": "a2a:remote"}
 
         async def run_search(task: TaskSpec) -> dict[str, Any]:
             return await web_search(task.input["query"], max_results=int(task.input.get("max_results", 3)))
@@ -410,7 +489,8 @@ class S13Runtime:
             "memory_recall": recall, "remember_explicit_fact": remember_explicit,
             "web_search": run_search, "fetch_url": run_fetch, "index_file": run_index,
             "list_directory": list_directory, "read_file": run_read_file, "create_reminder": create_reminder,
-            "answer_with_evidence": answer, "researcher": run_researcher, "retriever": run_retriever, **role_workers,
+            "answer_with_evidence": answer, "researcher": run_researcher, "retriever": run_retriever,
+            "remote_specialist": run_remote_specialist, **role_workers,
         }, max_workers=int(os.getenv("S13_MAX_WORKERS", "4"))).run(run_id, resume=resume)
         snapshot = self.graph.snapshot(run_id)
         answer = snapshot.nodes.get("answer", {}).get("result", {}) or snapshot.nodes.get("formatter", {}).get("result", {})

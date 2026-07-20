@@ -33,10 +33,14 @@ class A2AClient:
         interface = negotiate_interface(card, bindings=("JSONRPC",), versions=self.protocol_versions)
         return DiscoveredAgent(card=card, endpoint=interface["url"])
 
-    async def send(self, agent: DiscoveredAgent, text: str, *, push_url: str | None = None) -> dict[str, Any]:
+    async def send(self, agent: DiscoveredAgent, text: str, *, push_url: str | None = None,
+                   push_token: str | None = None) -> dict[str, Any]:
         configuration: dict[str, Any] = {}
         if push_url:
-            configuration["pushNotificationConfig"] = {"url": push_url}
+            push_config: dict[str, Any] = {"url": push_url}
+            if push_token:
+                push_config["token"] = push_token
+            configuration["pushNotificationConfig"] = push_config
         return await self._rpc(agent.endpoint, "message/send", self._message(text, configuration))
 
     async def cancel(self, agent: DiscoveredAgent, task_id: str) -> dict[str, Any]:
